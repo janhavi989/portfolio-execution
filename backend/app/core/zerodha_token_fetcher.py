@@ -10,18 +10,15 @@ Flow:
   4. We detect the redirect, extract request_token, close the browser
   5. Caller gets the request_token to exchange for an access_token
 
-This is "semi-automated":
-  - We automate opening the browser and capturing the token
-  - The user still types their own password and TOTP (we never touch those fields)
-
-Fix for WinError 193:
-  webdriver-manager 4.x has a bug on Windows where it returns the path to
-  THIRD_PARTY_NOTICES.chromedriver (a text file) instead of chromedriver.exe.
-  We bypass this by scanning the wdm cache for the actual .exe directly.
+Environments:
+  - Windows (local dev): Opens a visible Chrome window, user logs in manually.
+  - Docker/Linux: Runs Chrome in headless mode. User must complete login via
+    a VNC viewer or this feature is not usable in headless Docker.
 """
 import asyncio
 import glob
 import os
+import sys
 import time
 from typing import AsyncGenerator
 from urllib.parse import urlparse, parse_qs
@@ -34,33 +31,63 @@ KITE_LOGIN_URL = "https://kite.zerodha.com/connect/login"
 POLL_INTERVAL = 0.5   # seconds between URL checks
 MAX_WAIT = 180        # seconds before timeout (3 minutes)
 
+IS_WINDOWS = sys.platform == "win32"
+
+
+def _get_chrome_version() -> str | None:
+    """Read installed Chrome version from the Windows registry / filesystem."""
+    try:
+        chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        if not os.path.exists(chrome_exe):
+            chrome_exe = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+        if not os.path.exists(chrome_exe):
+            return None
+        import subprocess
+        result = subprocess.run(
+            ["powershell", "-Command",
+             f"(Get-Item '{chrome_exe}').VersionInfo.FileVersion"],
+            capture_output=True, text=True, timeout=5
+        )
+        version = result.stdout.strip()
+        return version if version else None
+    except Exception:
+        return None
+
 
 def _find_chromedriver_exe() -> str:
     """
-    Locate the correct 64-bit chromedriver.exe on Windows.
-
-    webdriver-manager 4.x has two bugs on Windows:
-      1. Returns path to THIRD_PARTY_NOTICES.chromedriver (text file) not the .exe
-      2. Downloads chromedriver-win32 (32-bit) even on 64-bit systems
-
+    Locate chromedriver on Windows by scanning the webdriver-manager cache.
     Strategy:
-      1. Prefer any path containing 'win64' in the wdm cache
-      2. Fall back to any chromedriver.exe in the cache (sorted newest first)
-      3. Last resort: 'chromedriver' on PATH
+      1. Get installed Chrome version (e.g. 145.0.7632.77)
+      2. Look for chromedriver-win64/chromedriver.exe for that exact version
+      3. Fall back to any win64 chromedriver.exe in cache (newest first)
+      4. Fall back to any win32 chromedriver.exe in cache (newest first)
+      5. Last resort: 'chromedriver' on PATH
+    On Linux: always return 'chromedriver' (installed via apt).
     """
-    wdm_cache = os.path.expanduser("~/.wdm/drivers/chromedriver")
-    if os.path.isdir(wdm_cache):
-        pattern = os.path.join(wdm_cache, "**", "chromedriver.exe")
-        matches = glob.glob(pattern, recursive=True)
-        if matches:
-            # Strongly prefer win64 builds over win32
-            win64 = [p for p in matches if "win64" in p.replace("\\", "/")]
-            win32 = [p for p in matches if "win64" not in p.replace("\\", "/")]
+    if not IS_WINDOWS:
+        logger.info("zerodha_token_fetcher.chromedriver", platform="linux", path="chromedriver")
+        return "chromedriver"
 
-            # Within each group sort by mtime descending (newest version first)
+    home = os.path.expanduser("~")
+    wdm_cache = os.path.join(home, ".wdm", "drivers", "chromedriver")
+
+    # Step 1 — try exact Chrome version match with win64
+    chrome_ver = _get_chrome_version()
+    if chrome_ver:
+        exact = os.path.join(wdm_cache, "win64", chrome_ver, "chromedriver-win64", "chromedriver.exe")
+        if os.path.isfile(exact):
+            logger.info("zerodha_token_fetcher.chromedriver_exact", path=exact, version=chrome_ver)
+            return exact
+
+    # Step 2 — scan entire cache, strongly prefer win64
+    if os.path.isdir(wdm_cache):
+        all_drivers = glob.glob(os.path.join(wdm_cache, "**", "chromedriver.exe"), recursive=True)
+        if all_drivers:
+            win64 = [p for p in all_drivers if "chromedriver-win64" in p]
+            win32 = [p for p in all_drivers if "chromedriver-win64" not in p]
             win64.sort(key=os.path.getmtime, reverse=True)
             win32.sort(key=os.path.getmtime, reverse=True)
-
             chosen = (win64 + win32)[0]
             logger.info("zerodha_token_fetcher.chromedriver_found", path=chosen)
             return chosen
@@ -83,7 +110,10 @@ async def fetch_zerodha_request_token(
     """
     login_url = f"{KITE_LOGIN_URL}?api_key={api_key}&v=3"
 
-    yield {"status": "opening", "message": "Launching browser window..."}
+    if IS_WINDOWS:
+        yield {"status": "opening", "message": "Launching Chrome browser window..."}
+    else:
+        yield {"status": "opening", "message": "Launching headless Chrome (Docker mode)..."}
 
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -95,14 +125,23 @@ async def fetch_zerodha_request_token(
             from selenium.webdriver.chrome.options import Options
             from selenium.webdriver.chrome.service import Service
 
-            # Find the actual chromedriver.exe — bypasses webdriver-manager bug
             chromedriver_path = _find_chromedriver_exe()
 
             options = Options()
-            options.add_argument("--window-size=520,700")
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option("useAutomationExtension", False)
+
+            if IS_WINDOWS:
+                # Visible window on Windows — user logs in manually
+                options.add_argument("--window-size=520,700")
+            else:
+                # Headless mode in Docker/Linux
+                options.add_argument("--headless=new")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--window-size=1280,800")
 
             service = Service(executable_path=chromedriver_path)
             driver = webdriver.Chrome(service=service, options=options)

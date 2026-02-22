@@ -4,8 +4,8 @@ Authentication Service — JWT token management and user operations.
 from datetime import datetime, timedelta
 from typing import Optional
 import uuid
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi import Depends, HTTPException, Query, status
@@ -15,16 +15,17 @@ from app.models.user import User
 from app.database import get_db
 from app.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    """Hash a password using bcrypt directly (no passlib)."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    """Verify a password against a bcrypt hash."""
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
