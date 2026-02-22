@@ -93,7 +93,7 @@ An end-to-end portfolio trade execution engine for Indian stock markets, built f
 
 ### 1. Clone the repo
 ```bash
-git clone <repo-url>
+git clone https://github.com/janhavi989/portfolio-execution.git
 cd portfolio-execution
 ```
 
